@@ -608,16 +608,16 @@ def main():
 
     # Educational Resources & Footer
     st.markdown("---")
-    st.subheader("Implementation Notes & Resources")
+    st.subheader("Final Notes & Resources")
     st.markdown("""
-    - **References**:
-        1. Brincker, R., & Ventura, C. (2015). *Introduction to Operational Modal Analysis*. Wiley.
-        2. Rainieri, C., & Fabbrocino, G. (2014). *Operational Modal Analysis of Civil Engineering Structures*. Springer.
-        3. Peeters, B., & De Roeck, G. (2001). Stochastic System Identification for Operational Modal Analysis: A Review.
-           Journal of Dynamic Systems, Measurement, and Control, 123(4), 659-667.
-        4. Brincker, R., Zhang, L., & Andersen, P. (2000). Modal identification from ambient responses using frequency domain decomposition.
-           Proceedings of the 18th Int. Modal Analysis Conference (IMAC), San Antonio, Texas.
-        5. Au, S. K. (2017). *Operational Modal Analysis: Modeling, Bayesian Inference, Uncertainty Laws*. Springer.
+    **References**:
+    1. Brincker, R., & Ventura, C. (2015). *Introduction to Operational Modal Analysis*. Wiley.
+    2. Rainieri, C., & Fabbrocino, G. (2014). *Operational Modal Analysis of Civil Engineering Structures*. Springer.
+    3. Peeters, B., & De Roeck, G. (2001). Stochastic System Identification for Operational Modal Analysis: A Review.
+       Journal of Dynamic Systems, Measurement, and Control, 123(4), 659-667.
+    4. Brincker, R., Zhang, L., & Andersen, P. (2000). Modal identification from ambient responses using frequency domain decomposition.
+       Proceedings of the 18th Int. Modal Analysis Conference (IMAC), San Antonio, Texas.
+    5. Au, S. K. (2017). *Operational Modal Analysis: Modeling, Bayesian Inference, Uncertainty Laws*. Springer.
 
     **Feedback & Collaboration**  
     - Non-stationary excitation sources  
