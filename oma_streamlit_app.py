@@ -717,15 +717,11 @@ def main():
         st.table(df_ident)
 
         # MAC Equation in LaTeX/Markdown
-        st.markdown(
+        st.latex(
             r"""
-            **MAC Formula**:
-
-            \[
-            \text{MAC}(\phi_i, \phi_j) 
-            = \frac{\left|\phi_i^T \phi_j\right|^2}
-                   {\left(\phi_i^T \phi_i\right)\left(\phi_j^T \phi_j\right)}
-            \]
+            \text{MAC} =
+            \frac{\left| \phi_i^T \phi_j \right|^2}
+                 {\left( \phi_i^T \phi_i \right) \left( \phi_j^T \phi_j \right)}
             """,
             unsafe_allow_html=True
         )
