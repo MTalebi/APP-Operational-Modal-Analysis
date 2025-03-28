@@ -722,9 +722,9 @@ def main():
             \text{MAC} =
             \frac{\left| \phi_i^T \phi_j \right|^2}
                  {\left( \phi_i^T \phi_i \right) \left( \phi_j^T \phi_j \right)}
-            """,
-            unsafe_allow_html=True
+            """
         )
+
 
         # Mode Shapes
         st.markdown("#### Mode Shape Visualization")
