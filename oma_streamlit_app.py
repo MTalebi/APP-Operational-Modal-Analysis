@@ -2,7 +2,9 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import altair as alt
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from scipy.signal import welch
+from numpy.linalg import svd, eig
 
 # -----------------------------------------------------------------------------
 # Author: Mohammad Talebi-Kalaleh
@@ -10,7 +12,7 @@ from typing import List, Dict
 # -----------------------------------------------------------------------------
 # This code implements an Operational Modal Analysis (OMA) educational tool in 
 # Python using Streamlit, illustrating Frequency Domain Decomposition (FDD) 
-# and (placeholder) Stochastic Subspace Identification (SSI).
+# and Stochastic Subspace Identification (SSI) with more realistic approaches.
 # -----------------------------------------------------------------------------
 
 # Session-state keys to store data across interactions
@@ -21,60 +23,75 @@ GENERATION_COMPLETE_KEY = "generation_complete"
 IS_ANALYZING_KEY = "is_analyzing"
 
 
+# -----------------------------------------------------------------------------
+# Data Generation
+# -----------------------------------------------------------------------------
 def generate_synthetic_data(params: dict):
     """
-    Generate synthetic measurements of a 3-mode vibrating system with noise.
-    Returns a list of dicts, each containing sensor id, position, and time-series data.
+    Generate synthetic acceleration measurements of a structure with 3 modes + noise.
+
+    Args:
+        params: Dictionary containing simulation parameters.
+
+    Returns:
+        measurements: A list of dictionaries, one per sensor:
+           {
+             "sensorId": str,
+             "position": float,
+             "data": [ { "time": float, "acceleration": float, ...}, ... ]
+           }
     """
+    # Unpack parameters
     bridge_length = params["bridgeLength"]
-    num_sensors = params["numSensors"]
-    mode1 = params["mode1"]
-    mode2 = params["mode2"]
-    mode3 = params["mode3"]
-    noise_level = params["noiseLevel"]
+    num_sensors   = params["numSensors"]
+    mode1         = params["mode1"]
+    mode2         = params["mode2"]
+    mode3         = params["mode3"]
+    noise_level   = params["noiseLevel"]
     sampling_freq = params["samplingFreq"]
-    duration = params["duration"]
+    duration      = params["duration"]
 
     dt = 1.0 / sampling_freq
     num_samples = int(np.floor(duration * sampling_freq))
 
-    # Sensor positions (uniformly distributed)
+    # Define sensor positions along the bridge (uniformly spaced)
     sensor_positions = np.linspace(
         bridge_length / (num_sensors + 1),
         bridge_length * (num_sensors / (num_sensors + 1)),
         num_sensors
     )
 
-    # Time vector
+    # Create time vector
     time_vector = np.arange(num_samples) * dt
 
-    # Generate time-domain modal responses
-    mode1_response = mode1["amp"] * np.sin(2 * np.pi * mode1["freq"] * time_vector)
-    mode2_response = mode2["amp"] * np.sin(2 * np.pi * mode2["freq"] * time_vector)
-    mode3_response = mode3["amp"] * np.sin(2 * np.pi * mode3["freq"] * time_vector)
+    # Create the three modal contributions in the time domain
+    mode1_response = mode1["amp"] * np.sin(2.0 * np.pi * mode1["freq"] * time_vector)
+    mode2_response = mode2["amp"] * np.sin(2.0 * np.pi * mode2["freq"] * time_vector)
+    mode3_response = mode3["amp"] * np.sin(2.0 * np.pi * mode3["freq"] * time_vector)
 
-    # Precompute sensor mode shapes
+    # Precompute theoretical mode shapes at each sensor position
+    # (simple pinned-pinned assumption for demonstration)
     mode_shapes = []
     for x in sensor_positions:
-        # Raw shape
-        shape1 = np.sin(np.pi * x / bridge_length)
-        shape2 = np.sin(2 * np.pi * x / bridge_length)
-        shape3 = np.sin(3 * np.pi * x / bridge_length)
-        mode_shapes.append((shape1, shape2, shape3))
+        s1 = np.sin(np.pi * x / bridge_length)
+        s2 = np.sin(2.0 * np.pi * x / bridge_length)
+        s3 = np.sin(3.0 * np.pi * x / bridge_length)
+        mode_shapes.append((s1, s2, s3))
 
-    # Generate the sensor measurements (time series)
+    # Generate time-series for each sensor (modal superposition + noise)
     measurements = []
     for i, x in enumerate(sensor_positions):
         shape1, shape2, shape3 = mode_shapes[i]
         data_list = []
+
         for t_idx in range(num_samples):
-            # Modal superposition
+            # Combine the three modal responses scaled by the sensor's mode-shape values
             m1 = shape1 * mode1_response[t_idx]
             m2 = shape2 * mode2_response[t_idx]
             m3 = shape3 * mode3_response[t_idx]
 
-            # Add random noise
-            noise = noise_level * (2 * np.random.rand() - 1)
+            # White noise
+            noise = noise_level * (2.0 * np.random.rand() - 1.0)
 
             total_acc = m1 + m2 + m3 + noise
             data_list.append({
@@ -96,10 +113,474 @@ def generate_synthetic_data(params: dict):
     return measurements
 
 
+# -----------------------------------------------------------------------------
+# Frequency Domain Decomposition (FDD) - Realistic Implementation
+# -----------------------------------------------------------------------------
+def perform_fdd(params: dict, measurements: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Perform Frequency Domain Decomposition on the measured signals.
+
+    Steps:
+      1. Arrange acceleration data into an (n_sensors x n_samples) matrix.
+      2. Estimate Cross-Power Spectral Density (CPSD) matrix using Welch's method 
+         (or direct FFT). For each frequency line, we get an n_sensors x n_sensors matrix.
+      3. Perform SVD of the CPSD matrix at each frequency line -> singular values/vectors.
+      4. Identify peaks in the first singular value near each "true" frequency to find 
+         identified frequencies. 
+      5. Extract the corresponding singular vectors at those frequencies as the 
+         identified mode shapes.
+      6. Return mode data (freq, shape, etc.) plus singular-value data for plotting.
+
+    Args:
+        params: Dictionary of OMA parameters.
+        measurements: Synthetic sensor data.
+
+    Returns:
+        identified_modes: List of dictionaries describing each identified mode.
+        svd_data: List of dictionaries containing frequencies and singular values 
+                  (for plotting).
+    """
+    # --- 1. Build (n_sensors x n_samples) acceleration matrix ---
+    n_sensors = len(measurements)
+    # Use first sensor's time length as reference
+    n_samples = len(measurements[0]["data"])
+
+    sampling_freq = params["samplingFreq"]
+    # Create an array for all sensors
+    data_matrix = np.zeros((n_sensors, n_samples))
+    for i, sens in enumerate(measurements):
+        data_matrix[i, :] = [pt["acceleration"] for pt in sens["data"]]
+
+    # --- 2. Estimate cross-power spectra: Gxx(f) ---
+    # Use Welch's method to get a consistent frequency resolution
+    # We'll use 'welch' from scipy.signal, computing cross-spectral densities.
+    # A simpler approach is pairwise "csd" for each sensor pair, 
+    # then assemble Gxx. For demonstration, we'll do it pairwise.
+    # We store all frequencies + cross-spectra in a 3D array: Gxx[freq_index, i, j].
+    # Also store the single-sided frequencies that Welch returns.
+
+    # Frequency resolution:
+    nperseg = 1024 if n_samples >= 1024 else n_samples
+    # We will gather the cross-power spectral matrix for each frequency bin
+    # from i=0..(n_sensors-1) to j=0..(n_sensors-1).
+    # Note that for i=j we get the auto-power spectral densities (PSDs).
+
+    # Because Welch's csd uses 'scipy.signal.csd(x, y)', we'll do pairwise computations.
+    freqs = None
+    # For storing cross-spectral matrices: shape => (n_freqs, n_sensors, n_sensors)
+    Gxx_list = []
+
+    # We must figure out the frequency axis from one pair, then fill in the rest
+    for i in range(n_sensors):
+        for j in range(i, n_sensors):
+            f_ij, P_ij = welch(data_matrix[i, :], data_matrix[j, :],
+                               fs=sampling_freq, nperseg=nperseg,
+                               scaling='density', window='hann', detrend=False)
+            if freqs is None:
+                freqs = f_ij
+                n_freqs = len(freqs)
+                # Initialize the 3D array
+                Gxx = np.zeros((n_freqs, n_sensors, n_sensors), dtype=complex)
+
+            # Fill in the symmetrical components
+            # For real signals, Gxy = conj(Gyx), but welch might be real if i=j
+            Gxx[:, i, j] = P_ij
+            Gxx[:, j, i] = np.conjugate(P_ij)
+
+    Gxx_list = Gxx
+
+    # --- 3. Perform SVD of Gxx at each frequency line ---
+    # We'll extract the first 3 singular values for plotting.
+    svd_data = []
+    for idx_f, f in enumerate(freqs):
+        U, S, _ = svd(Gxx_list[idx_f, :, :], full_matrices=True)
+        # We only store the first 3 singular values for plotting
+        sv1 = np.abs(S[0]) if len(S) > 0 else 0.0
+        sv2 = np.abs(S[1]) if len(S) > 1 else 0.0
+        sv3 = np.abs(S[2]) if len(S) > 2 else 0.0
+
+        svd_data.append({
+            "frequency": f,
+            "sv1": sv1,
+            "sv2": sv2,
+            "sv3": sv3
+        })
+
+    # --- 4. Identify peaks near each "true" frequency ---
+    # For demonstration, we know we have 3 modes: mode1, mode2, mode3
+    # We'll do a local search around each true freq ± a certain bandwidth.
+    # Then the identified frequency is the local maximum of sv1 in that region.
+    mode1_true = params["mode1"]["freq"]
+    mode2_true = params["mode2"]["freq"]
+    mode3_true = params["mode3"]["freq"]
+    bandwidth  = 1.5  # search ±1.5 Hz around each true freq
+
+    identified_freqs = []
+    identified_shapes = []
+
+    for true_f in [mode1_true, mode2_true, mode3_true]:
+        f_min = max(true_f - bandwidth, 0.0)
+        f_max = true_f + bandwidth
+
+        # Extract the sub-array of frequencies within [f_min, f_max]
+        # and find the index of the maximum sv1 in that region
+        candidate_points = [(i, d) for i, d in enumerate(svd_data) 
+                            if d["frequency"] >= f_min and d["frequency"] <= f_max]
+        if not candidate_points:
+            # If no data in that band, fallback to the nearest frequency
+            # or just skip
+            # We'll pick the closest freq
+            best_idx = np.argmin([abs(d["frequency"] - true_f) for d in svd_data])
+        else:
+            # Among candidate_points, find the max of sv1
+            best_idx = max(candidate_points, key=lambda x: x[1]["sv1"])[0]
+
+        identified_freq = svd_data[best_idx]["frequency"]
+        identified_freqs.append(identified_freq)
+
+        # The singular vectors at that frequency define the mode shape
+        # We'll do an SVD again (or we can store U from above if we prefer).
+        U_best, S_best, V_best = svd(Gxx_list[best_idx, :, :], full_matrices=True)
+
+        # The first singular vector (U[:, 0]) is the mode shape in output space
+        mode_shape = U_best[:, 0].real  # take real part
+        # We'll store this shape for subsequent MAC comparisons
+        identified_shapes.append(mode_shape)
+
+    # --- 5. Build identified mode dictionaries for each mode ---
+    # We'll compare with the theoretical sensor-by-sensor shape
+    # from the measurement definitions, in finalize_modes below.
+    identified_modes = finalize_modes_fdd(measurements, identified_freqs, [mode1_true, mode2_true, mode3_true], identified_shapes)
+
+    return identified_modes, svd_data
+
+
+def finalize_modes_fdd(measurements, identified_freqs, true_freqs, identified_shapes):
+    """
+    Finalize the FDD results by comparing identified shapes vs. true shapes sensor-by-sensor,
+    normalizing, and computing MAC.
+
+    Args:
+        measurements: The synthetic data (to get sensor positions & true shapes).
+        identified_freqs: List of identified frequencies for modes 1, 2, 3.
+        true_freqs: List of true frequencies [f1, f2, f3].
+        identified_shapes: List of (n_sensors) arrays containing identified shapes from SVD 
+                           for each identified frequency.
+
+    Returns:
+        A list of dictionaries describing each identified mode: 
+        {
+          "modeNumber": int,
+          "trueFrequency": float,
+          "identifiedFrequency": float,
+          "frequencyError": str,
+          "mac": str,
+          "modeShapes": [ { "sensorId", "position", "trueShape", "identifiedShape" }, ... ]
+        }
+    """
+    n_sensors = len(measurements)
+    sensor_positions = [m["position"] for m in measurements]
+
+    # Compute "true" shapes from geometry, 
+    # same assumption: pinned-pinned, shape = sin(n * pi * x / L)
+    L = measurements[0]["position"] * (n_sensors+1)/n_sensors  # or from params (bridgeLength)
+    # Actually simpler: we can retrieve from the data directly (since we generated them),
+    # but let's recalc for demonstration.
+    
+    def true_shape(mode_number, x):
+        return np.sin(mode_number * np.pi * x / L)
+
+    # Build table of shapes sensor-by-sensor
+    # identified_shapes[i] is the shape for the i-th mode
+    identified_modes = []
+    for i, mode_num in enumerate([1, 2, 3]):
+        freq_true = true_freqs[i]
+        freq_ident = identified_freqs[i]
+        # shape from SVD
+        shape_ident = identified_shapes[i]
+
+        # build sensor-based shape info
+        sensor_data = []
+        for s_idx, sens in enumerate(measurements):
+            x_sens = sens["position"]
+            # True shape (unnormalized)
+            ts = true_shape(mode_num, x_sens)
+            # Identified shape from the 1st singular vector => shape_ident[s_idx]
+            sensor_data.append({
+                "sensorId": sens["sensorId"],
+                "position": x_sens,
+                "trueShape": ts,
+                "identifiedShape": shape_ident[s_idx]
+            })
+
+        # Normalize, compute MAC, frequency error
+        # We'll do that with a helper:
+        mode_dict = finalize_mode_entry(mode_num, freq_true, freq_ident, sensor_data)
+        identified_modes.append(mode_dict)
+
+    return identified_modes
+
+
+# -----------------------------------------------------------------------------
+# SSI Implementation (COV-SSI) - Realistic Illustration
+# -----------------------------------------------------------------------------
+def perform_ssi(params: dict, measurements: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Perform Stochastic Subspace Identification (SSI) on the measured signals (COV-SSI variant).
+
+    Steps (COV-SSI approach in a simplified educational manner):
+      1. Collect multi-sensor data into array X (n_sensors x n_samples).
+      2. Estimate correlation functions / Toeplitz matrix from the data (the 'R' matrix).
+      3. Build block Hankel or Toeplitz matrix from R.
+      4. Compute SVD to obtain extended observability matrix.
+      5. Estimate system matrices (A, C) from it, then eigen-decomposition to get frequencies and mode shapes.
+      6. Compare with true frequencies and shapes (like we do in FDD).
+
+    Returns:
+        identified_modes: List of identified mode dictionaries.
+        svd_data: An empty or minimal list, since pure SSI doesn't produce "singular value vs frequency."
+    """
+    # 1. Build data matrix
+    n_sensors = len(measurements)
+    n_samples = len(measurements[0]["data"])
+    X = np.zeros((n_sensors, n_samples))
+    for i, sens in enumerate(measurements):
+        X[i, :] = [pt["acceleration"] for pt in sens["data"]]
+
+    # 2. Estimate correlation function. We'll do a naive approach:
+    #    Let R[k] = E[X(t) X(t+k)^T],  k=0..max_lags
+    #    We'll set max_lags = something like 2*n_sensors or a user-chosen factor.
+    max_lags = 3 * n_sensors  # simplistic choice
+    R = [np.zeros((n_sensors, n_sensors)) for _ in range(max_lags)]
+    # For unbiased estimate, we sum over t for which t+k < n_samples
+    for k in range(max_lags):
+        valid_count = 0
+        for t in range(n_samples - k):
+            x_t   = X[:, t][:, None]      # shape (n_sensors,1)
+            x_tk  = X[:, t+k][None, :]    # shape (1,n_sensors)
+            R[k] += x_t @ x_tk
+            valid_count += 1
+        if valid_count > 0:
+            R[k] /= valid_count
+
+    # 3. Build Block Hankel/Toeplitz matrix from correlation slices
+    #    Typical subspace approach: big Toeplitz of block-rows [R1 R2 ... R_i]
+    #    We'll do a minimal version: pick i = j = 10 (model order ~ 6).
+    i_block = 10
+    # Construct an extended data matrix H0 from R[1..i_block].
+    # shape => (n_sensors*i_block) x (n_sensors*i_block) if we do symmetrical, but let's keep it simple.
+    H = []
+    for row in range(i_block):
+        # horizontally we stack R[row+1], R[row+2], ...
+        row_blocks = [R[col+row+1] for col in range(i_block)]
+        H.append(np.hstack(row_blocks))
+    H0 = np.vstack(H)  # shape => (n_sensors*i_block, n_sensors*i_block)
+
+    # 4. SVD of this Hankel-like matrix
+    U, S, Vt = svd(H0, full_matrices=False)
+    # Choose a model order. We expect 2*modes or 2*3=6. We'll just pick 6 for this example.
+    model_order = 6
+    U1 = U[:, :model_order]
+    S1 = np.diag(S[:model_order])
+    V1 = Vt[:model_order, :]
+
+    # The extended observability matrix O_ext ~ U1 * sqrt(S1)
+    # The extended controllability is ~ sqrt(S1)*V1
+    O_ext = U1 @ (S1 ** 0.5)
+    C = O_ext[0:n_sensors, :]  # The first block row is the output matrix
+    # Next block row used to find A
+    O_down = O_ext[n_sensors:, :]  # shift by one block row
+    # Pseudoinverse
+    O_up_pinv = np.linalg.pinv(O_ext[:-n_sensors, :])
+
+    # The system matrix A is roughly O_down * O_up_pinv
+    A_est = O_down @ O_up_pinv
+
+    # 5. Eigen-decomposition to find frequencies + mode shapes
+    #    The discrete-time poles are eigenvalues of A_est. Convert to continuous freq.
+    eigvals, eigvecs = eig(A_est)
+    dt = 1.0 / params["samplingFreq"]
+
+    # Natural freq (Hz) from discrete pole lambda => freq = angle/(2*pi*dt)
+    # Damping can also be extracted, but we'll skip for brevity. 
+    # The mode shape is row-space of C * eigenvector
+    # We'll identify 3 largest stable modes with positive freq below Nyquist, etc.
+    # For demonstration, we just pick the 3 with largest imaginary parts or near the known frequencies.
+
+    # Build a list of (freq_hz, shape_vector)
+    identified_poles = []
+    for idx, lam in enumerate(eigvals):
+        mag = np.abs(lam)
+        # If system stable => mag < 1. We'll keep it if 0<mag<1
+        if mag < 1.0:
+            # Discrete-time angle
+            wn_dt = np.angle(lam)
+            freq_hz = wn_dt / (2.0 * np.pi * dt)
+            # Mode shape ~ C * eigenvector
+            shape = C @ eigvecs[:, idx]
+            identified_poles.append((freq_hz, shape))
+
+    # Sort by ascending absolute frequency (just to pick the first 3 that match the "positive" freq)
+    identified_poles.sort(key=lambda x: abs(x[0]))
+
+    # If fewer than 3 stable poles, fill up with zeros. Otherwise pick 3 that
+    # best match the known frequencies. We'll do a nearest approach around each true freq
+    mode1_true = params["mode1"]["freq"]
+    mode2_true = params["mode2"]["freq"]
+    mode3_true = params["mode3"]["freq"]
+
+    # We'll do a small function to pick best match near a true freq
+    def pick_pole_near_freq(true_f, candidates, bandwidth=1.5):
+        # find subset of candidates freq in [true_f - band, true_f + band]
+        subset = [(fr, shp) for (fr, shp) in candidates if abs(fr - true_f) <= bandwidth]
+        if not subset:
+            # fallback to closest
+            best = min(candidates, key=lambda x: abs(x[0] - true_f))
+        else:
+            # pick the largest magnitude shape or simply pick the freq closest to true_f
+            best = min(subset, key=lambda x: abs(x[0] - true_f))
+        return best
+
+    # pick each mode from the candidate poles
+    f1, shape1 = pick_pole_near_freq(mode1_true, identified_poles)
+    f2, shape2 = pick_pole_near_freq(mode2_true, identified_poles)
+    f3, shape3 = pick_pole_near_freq(mode3_true, identified_poles)
+
+    # finalize
+    identified_modes = finalize_modes_ssi(measurements,
+                                          [f1, f2, f3],
+                                          [mode1_true, mode2_true, mode3_true],
+                                          [shape1, shape2, shape3])
+    # For SSI we typically do not have a "singular values vs. frequency" plot 
+    # like FDD, so we might return empty or some representation of singular values from H0.
+    # We'll provide a minimal placeholder if we want to visualize something:
+    svd_data = []
+    for i, val in enumerate(np.diag(S1)):
+        svd_data.append({"frequency": float(i), "sv1": float(val), "sv2": 0.0, "sv3": 0.0})
+
+    return identified_modes, svd_data
+
+
+def finalize_modes_ssi(measurements, identified_freqs, true_freqs, identified_shapes):
+    """
+    Finalize the SSI results, building identified mode dictionaries with MAC, frequency error, etc.
+
+    Args:
+        measurements: Synthetic data with sensor positions.
+        identified_freqs: 3 identified frequencies from the subspace method.
+        true_freqs: 3 known (true) frequencies from the simulation.
+        identified_shapes: 3 arrays containing the identified mode shape in output space.
+
+    Returns:
+        A list of dictionaries describing each identified mode.
+    """
+    # We can do exactly the same approach as finalize_modes_fdd,
+    # except that the identified shape dimension might differ if the model order 
+    # is large. We'll assume dimension = n_sensors or a partial row of size n_sensors.
+
+    def true_shape(m, x, L):
+        return np.sin(m * np.pi * x / L)
+
+    n_sensors = len(measurements)
+    L = measurements[0]["position"] * (n_sensors+1)/n_sensors
+
+    identified_modes = []
+    for i, mode_num in enumerate([1, 2, 3]):
+        freq_true  = true_freqs[i]
+        freq_ident = identified_freqs[i]
+        shape_ident = identified_shapes[i]
+
+        # shape_ident might be longer than n_sensors if C is bigger, 
+        # so we only take the first n_sensors
+        shape_ident_sensors = shape_ident[:n_sensors]
+
+        sensor_data = []
+        for s_idx, sens in enumerate(measurements):
+            x_sens = sens["position"]
+            ts = true_shape(mode_num, x_sens, L)
+            sensor_data.append({
+                "sensorId": sens["sensorId"],
+                "position": x_sens,
+                "trueShape": ts,
+                "identifiedShape": shape_ident_sensors[s_idx].real
+            })
+
+        # finalize
+        mode_dict = finalize_mode_entry(mode_num, freq_true, freq_ident, sensor_data)
+        identified_modes.append(mode_dict)
+
+    return identified_modes
+
+
+# -----------------------------------------------------------------------------
+# Common Helper to finalize each Mode (normalization, MAC, frequency error)
+# -----------------------------------------------------------------------------
+def finalize_mode_entry(mode_number, freq_true, freq_ident, sensor_data):
+    """
+    Normalizes identified & true shapes, computes MAC, frequency error, 
+    and builds a consistent dictionary for the mode results.
+    """
+    df = pd.DataFrame(sensor_data)
+
+    # Normalization
+    max_true = df["trueShape"].abs().max()
+    max_ident = df["identifiedShape"].abs().max()
+    if max_true < 1e-12:
+        max_true = 1.0
+    if max_ident < 1e-12:
+        max_ident = 1.0
+
+    df["trueShapeN"] = df["trueShape"] / max_true
+    df["identifiedShapeN"] = df["identifiedShape"] / max_ident
+
+    # MAC
+    mac_val = calculate_mac(df["trueShapeN"].values, df["identifiedShapeN"].values)
+    # Freq error
+    freq_error_percent = ( (freq_ident - freq_true) / freq_true ) * 100.0 if freq_true != 0 else 0.0
+
+    # Repackage sensor-based info
+    mode_shapes_list = []
+    for row in df.itertuples():
+        mode_shapes_list.append({
+            "sensorId": row.sensorId,
+            "position": row.position,
+            "trueShape": row.trueShapeN,
+            "identifiedShape": row.identifiedShapeN
+        })
+
+    return {
+        "modeNumber": mode_number,
+        "trueFrequency": freq_true,
+        "identifiedFrequency": freq_ident,
+        "frequencyError": f"{freq_error_percent:.2f}",
+        "mac": f"{mac_val:.4f}",
+        "modeShapes": mode_shapes_list
+    }
+
+
+# -----------------------------------------------------------------------------
+# MAC Calculation
+# -----------------------------------------------------------------------------
+def calculate_mac(mode1: np.ndarray, mode2: np.ndarray) -> float:
+    """
+    Compute the Modal Assurance Criterion (MAC) between two mode-shape vectors.
+
+    MAC(phi1, phi2) = |phi1^T phi2|^2 / ( (phi1^T phi1)*(phi2^T phi2) )
+    """
+    numerator = (np.sum(mode1 * mode2)) ** 2
+    denominator = np.sum(mode1**2) * np.sum(mode2**2)
+    if denominator < 1e-16:
+        return 0.0
+    return float(numerator / denominator)
+
+
+# -----------------------------------------------------------------------------
+# Main Analysis Wrapper
+# -----------------------------------------------------------------------------
 def perform_analysis(analysis_method: str, params: dict, measurements: List[Dict]):
     """
-    Wrapper to perform OMA analysis (FDD or SSI).
-    Returns the identified modes and SVD data (if FDD).
+    Wrapper to call the 'true' FDD or 'true' SSI method (not simplified).
+    Returns the identified modes and SVD data (if applicable).
     """
     if analysis_method == "FDD":
         return perform_fdd(params, measurements)
@@ -109,163 +590,9 @@ def perform_analysis(analysis_method: str, params: dict, measurements: List[Dict
         return [], []
 
 
-def perform_fdd(params: dict, measurements: List[Dict]):
-    """
-    Frequency Domain Decomposition (simplified educational version).
-    Returns: 
-        identified_modes (list of dict)
-        svd_data (list of dict for frequency vs singular values)
-    """
-    mode1 = params["mode1"]
-    mode2 = params["mode2"]
-    mode3 = params["mode3"]
-
-    # For demonstration, we build a "synthetic" SVD with peaks at known frequencies (with noise).
-    # We'll sample across a frequency axis up to 2*(third mode frequency).
-    max_freq = 2.0 * mode3["freq"]
-    freq_count = 50  # number of points
-    frequency_axis = np.linspace(0, max_freq, freq_count)
-
-    svd_data = []
-    for f in frequency_axis:
-        sv1 = (10 / (1 + ((f - mode1["freq"]) * 1.5)**2)
-               + 5 / (1 + ((f - mode2["freq"]) * 1.0)**2)
-               + 2 / (1 + ((f - mode3["freq"]) * 0.8)**2)
-               + 0.2 * np.random.rand())
-        sv2 = (2 / (1 + ((f - mode1["freq"]) * 2.0)**2)
-               + 1 / (1 + ((f - mode2["freq"]) * 1.5)**2)
-               + 0.5 / (1 + ((f - mode3["freq"]) * 1.0)**2)
-               + 0.1 * np.random.rand())
-        sv3 = (0.5 / (1 + ((f - mode1["freq"]) * 3.0)**2)
-               + 0.3 / (1 + ((f - mode2["freq"]) * 2.0)**2)
-               + 0.2 / (1 + ((f - mode3["freq"]) * 1.5)**2)
-               + 0.05 * np.random.rand())
-        svd_data.append({
-            "frequency": f,
-            "sv1": sv1,
-            "sv2": sv2,
-            "sv3": sv3
-        })
-
-    # Simulate identified frequencies (slight random error)
-    identified_freq1 = mode1["freq"] * (1 + (np.random.rand() * 0.04 - 0.02))
-    identified_freq2 = mode2["freq"] * (1 + (np.random.rand() * 0.05 - 0.025))
-    identified_freq3 = mode3["freq"] * (1 + (np.random.rand() * 0.06 - 0.03))
-
-    # Build identified mode shapes with small error
-    identified_mode_shapes = []
-    for sensor in measurements:
-        x = sensor["position"]
-        true_mode1 = np.sin(np.pi * x / params["bridgeLength"])
-        true_mode2 = np.sin(2 * np.pi * x / params["bridgeLength"])
-        true_mode3 = np.sin(3 * np.pi * x / params["bridgeLength"])
-
-        # Add small error
-        identified_mode1 = true_mode1 * (1 + (np.random.rand() * 0.1 - 0.05))
-        identified_mode2 = true_mode2 * (1 + (np.random.rand() * 0.15 - 0.075))
-        identified_mode3 = true_mode3 * (1 + (np.random.rand() * 0.2 - 0.1))
-
-        identified_mode_shapes.append({
-            "sensorId": sensor["sensorId"],
-            "position": x,
-            "trueMode1": true_mode1,
-            "trueMode2": true_mode2,
-            "trueMode3": true_mode3,
-            "identifiedMode1": identified_mode1,
-            "identifiedMode2": identified_mode2,
-            "identifiedMode3": identified_mode3
-        })
-
-    # Normalize for MAC and finalize results
-    identified_modes = finalize_modes(
-        identified_mode_shapes,
-        [mode1["freq"], mode2["freq"], mode3["freq"]],
-        [identified_freq1, identified_freq2, identified_freq3]
-    )
-
-    return identified_modes, svd_data
-
-
-def perform_ssi(params: dict, measurements: List[Dict]):
-    """
-    Simplified SSI approach that currently just calls the FDD logic.
-    Replace with an actual SSI method if needed.
-    """
-    identified_modes, svd_data = perform_fdd(params, measurements)
-    return identified_modes, svd_data
-
-
-def finalize_modes(identified_mode_shapes, true_freqs, identified_freqs):
-    """
-    Computes MAC values and frequency errors, returns a list of identified mode dicts.
-    """
-    arr = pd.DataFrame(identified_mode_shapes)
-
-    # Get max absolute values for each true and identified mode shape to normalize
-    max_abs_true1 = arr["trueMode1"].abs().max()
-    max_abs_true2 = arr["trueMode2"].abs().max()
-    max_abs_true3 = arr["trueMode3"].abs().max()
-
-    max_abs_ident1 = arr["identifiedMode1"].abs().max()
-    max_abs_ident2 = arr["identifiedMode2"].abs().max()
-    max_abs_ident3 = arr["identifiedMode3"].abs().max()
-
-    # Normalize
-    arr["trueMode1_n"] = arr["trueMode1"] / max_abs_true1
-    arr["trueMode2_n"] = arr["trueMode2"] / max_abs_true2
-    arr["trueMode3_n"] = arr["trueMode3"] / max_abs_true3
-
-    arr["identifiedMode1_n"] = arr["identifiedMode1"] / max_abs_ident1
-    arr["identifiedMode2_n"] = arr["identifiedMode2"] / max_abs_ident2
-    arr["identifiedMode3_n"] = arr["identifiedMode3"] / max_abs_ident3
-
-    # Calculate MAC for each mode
-    mac1 = calculate_mac(arr["trueMode1_n"].values, arr["identifiedMode1_n"].values)
-    mac2 = calculate_mac(arr["trueMode2_n"].values, arr["identifiedMode2_n"].values)
-    mac3 = calculate_mac(arr["trueMode3_n"].values, arr["identifiedMode3_n"].values)
-
-    # Prepare result
-    results = []
-    for i, mode_num in enumerate([1, 2, 3]):
-        true_freq = true_freqs[i]
-        ident_freq = identified_freqs[i]
-        freq_error = ((ident_freq - true_freq) / true_freq) * 100
-        mac_val = [mac1, mac2, mac3][i]
-
-        tm_col = f"trueMode{mode_num}_n"
-        im_col = f"identifiedMode{mode_num}_n"
-
-        mode_shapes = []
-        for _, row in arr.iterrows():
-            mode_shapes.append({
-                "sensorId": row["sensorId"],
-                "position": row["position"],
-                "trueShape": row[tm_col],
-                "identifiedShape": row[im_col]
-            })
-
-        results.append({
-            "modeNumber": mode_num,
-            "trueFrequency": true_freq,
-            "identifiedFrequency": ident_freq,
-            "frequencyError": f"{freq_error:.2f}",
-            "mac": f"{mac_val:.4f}",
-            "modeShapes": mode_shapes
-        })
-    return results
-
-
-def calculate_mac(mode1: np.ndarray, mode2: np.ndarray) -> float:
-    """
-    Calculate the Modal Assurance Criterion (MAC) between two mode shape vectors.
-    """
-    numerator = (np.sum(mode1 * mode2))**2
-    denominator = np.sum(mode1**2) * np.sum(mode2**2)
-    if denominator == 0:
-        return 0.0
-    return numerator / denominator
-
-
+# -----------------------------------------------------------------------------
+# Streamlit App
+# -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Operational Modal Analysis Tool", layout="wide")
 
@@ -281,16 +608,20 @@ def main():
     # Introduction Section
     with st.expander("Introduction to OMA", expanded=False):
         st.write("""
-        **Operational Modal Analysis (OMA)** is used to identify the dynamic properties (natural frequencies, 
-        damping ratios, and mode shapes) of structures under their normal operating conditions 
-        (ambient vibrations). 
+        **Operational Modal Analysis (OMA)** is used to identify the dynamic properties 
+        (natural frequencies, damping ratios, and mode shapes) of structures 
+        under their normal operating conditions (ambient vibrations). 
 
         This educational tool demonstrates two OMA techniques:
-        - **Frequency Domain Decomposition (FDD)**
-        - **Stochastic Subspace Identification (SSI)** (placeholder)
+        - **Frequency Domain Decomposition (FDD)**:
+          - Constructs cross-power spectral density (CPSD) matrices at each frequency 
+            and uses singular value decomposition (SVD) to identify modes.
+        - **Stochastic Subspace Identification (SSI)**:
+          - Relies on time-domain correlations and state-space modeling to extract 
+            system matrices and modal parameters.
 
-        Use the parameters below to generate synthetic data and perform analysis to see 
-        how well the identified modes match the "true" modes.
+        Use the parameters below to generate synthetic data and perform analysis 
+        to see how well the identified modes match the "true" modes.
         """)
 
     # Default session-state parameters
@@ -371,7 +702,7 @@ def main():
     if st.session_state[GENERATION_COMPLETE_KEY] and measurements:
         st.markdown("**Synthetic Measurements Preview**")
 
-        first_sensor_data = measurements[0]["data"][:500]  # limit to 500 points
+        first_sensor_data = measurements[0]["data"][:500]  # limit to 500 points for quick plotting
         if first_sensor_data:
             df_sensor = pd.DataFrame(first_sensor_data)
             st.caption(f"Acceleration Time History (Sensor {measurements[0]['sensorId']})")
@@ -436,9 +767,9 @@ def main():
     if identified_modes:
         st.markdown(f"### Analysis Results ({analysis_method})")
 
-        # For FDD, show SVD plots
+        # For FDD, show SVD plots of cross-power spectral decomposition
         if analysis_method == "FDD" and svd_data:
-            st.markdown("#### Singular Value Decomposition")
+            st.markdown("#### Singular Value Decomposition (from CPSD)")
             df_svd = pd.DataFrame(svd_data)
 
             col_svd1, col_svd2, col_svd3 = st.columns(3)
@@ -460,7 +791,7 @@ def main():
                     tooltip=["frequency", "sv1"]
                 )
                 chart_sv1 = c1
-                # Add reference lines
+                # Add reference lines for the known true frequencies
                 ref1 = make_ref_line(params["mode1"]["freq"])
                 ref2 = make_ref_line(params["mode2"]["freq"])
                 ref3 = make_ref_line(params["mode3"]["freq"])
@@ -498,9 +829,12 @@ def main():
                 st.altair_chart(chart_sv3, use_container_width=True)
 
             st.info(
-                "Peaks in the first singular value often correspond to the natural frequencies. "
-                "The second and third singular values help identify closely spaced modes."
+                "FDD uses the cross-power spectral density (CPSD) matrix at each frequency. "
+                "A peak in the first singular value often indicates a structural mode. "
+                "The singular vectors provide the mode shapes."
             )
+
+        # If SSI, we might have a minimal SVD plot or none. We'll just show the table normally.
 
         # Identified Modal Parameters
         st.markdown("#### Identified Modal Parameters")
@@ -522,7 +856,9 @@ def main():
             **MAC Formula**:
 
             \[
-            \text{MAC}(\phi_i, \phi_j) = \frac{\left|\phi_i^T \phi_j\right|^2}{\left(\phi_i^T \phi_i\right)\left(\phi_j^T \phi_j\right)}
+            \text{MAC}(\phi_i, \phi_j) 
+            = \frac{\left|\phi_i^T \phi_j\right|^2}
+                   {\left(\phi_i^T \phi_i\right)\left(\phi_j^T \phi_j\right)}
             \]
             """,
             unsafe_allow_html=True
@@ -538,59 +874,54 @@ def main():
                 st.markdown(f"**Mode {mode_info['modeNumber']}**")
 
                 df_mode = pd.DataFrame(mode_info["modeShapes"])
-                mode_num = mode_info["modeNumber"]
-
-                # Create a dense array for the "true shape"
+                # We'll plot lines: the "true" shape and the "identified" shape. 
+                # They are already normalized to [-1, 1], approximately.
                 x_dense = np.linspace(0, params["bridgeLength"], 100)
-                if mode_num == 1:
-                    y_dense_raw = np.sin(np.pi * x_dense / params["bridgeLength"])
-                elif mode_num == 2:
-                    y_dense_raw = np.sin(2*np.pi * x_dense / params["bridgeLength"])
-                else:
-                    y_dense_raw = np.sin(3*np.pi * x_dense / params["bridgeLength"])
 
-                max_abs_val = np.max(np.abs(y_dense_raw))
-                y_dense_norm = y_dense_raw / max_abs_val
-                df_true_dense = pd.DataFrame({"position": x_dense, "trueShape": y_dense_norm})
+                # Build an Altair chart for the identified shapes
+                # We'll do the same approach: dashed line for "true shape" (interpolated),
+                # a continuous line for the identified shape + sensor points. 
+                # But we already have the discrete sensor data in df_mode. 
+                # So let's just plot them as lines with a 0 at start and end.
 
-                # Identified shape from sensors + zero endpoints
-                identified_points = [{"position": 0.0, "identifiedShape": 0.0}]
-                for row in df_mode.itertuples():
-                    identified_points.append({
-                        "position": row.position,
-                        "identifiedShape": row.identifiedShape
-                    })
-                identified_points.append({"position": params["bridgeLength"], "identifiedShape": 0.0})
-                df_ident_curve = pd.DataFrame(identified_points)
+                # "True shape" line: we can just connect the sensor positions 
+                # or do a function-based approach. We'll do sensor-based here:
+                # Insert a zero at start & end for a pinned shape visually:
+                df_true_line = pd.concat([
+                    pd.DataFrame({"position": [0], "trueShapeN": [0]}),
+                    df_mode[["position", "trueShape"]].rename(columns={"trueShape": "trueShapeN"}),
+                    pd.DataFrame({"position": [params["bridgeLength"]], "trueShapeN": [0]})
+                ], ignore_index=True)
 
-                # True shape line (dashed gray)
-                line_true = alt.Chart(df_true_dense).mark_line(
+                df_ident_line = pd.concat([
+                    pd.DataFrame({"position": [0], "identifiedShapeN": [0]}),
+                    df_mode[["position", "identifiedShape"]].rename(columns={"identifiedShape": "identifiedShapeN"}),
+                    pd.DataFrame({"position": [params["bridgeLength"]], "identifiedShapeN": [0]})
+                ], ignore_index=True)
+
+                line_true = alt.Chart(df_true_line).mark_line(
                     strokeDash=[5, 3],
                     color="gray"
                 ).encode(
                     x=alt.X("position", title="Position (m)"),
-                    y=alt.Y("trueShape", 
+                    y=alt.Y("trueShapeN", 
                             title="Normalized Amplitude",
                             scale=alt.Scale(domain=[-1.1, 1.1])
-                    ),
-                    tooltip=["position", "trueShape"]
+                    )
                 )
 
-                # Identified shape line
-                line_ident = alt.Chart(df_ident_curve).mark_line(color="red").encode(
+                line_ident = alt.Chart(df_ident_line).mark_line(color="red").encode(
                     x="position",
-                    y=alt.Y("identifiedShape", scale=alt.Scale(domain=[-1.1, 1.1]))
+                    y=alt.Y("identifiedShapeN", scale=alt.Scale(domain=[-1.1, 1.1]))
                 )
-
-                # Identified shape points
-                points_ident = alt.Chart(df_ident_curve).mark_point(
+                points_ident = alt.Chart(df_mode).mark_point(
                     color="red",
                     filled=True,
                     size=50
                 ).encode(
                     x="position",
-                    y="identifiedShape",
-                    tooltip=["position", "identifiedShape"]
+                    y=alt.Y("identifiedShape", scale=alt.Scale(domain=[-1.1, 1.1])),
+                    tooltip=["sensorId", "identifiedShape"]
                 )
 
                 chart_mode = (line_true + line_ident + points_ident).properties(
@@ -613,10 +944,10 @@ def main():
     **References**:
     1. Brincker, R., & Ventura, C. (2015). *Introduction to Operational Modal Analysis*. Wiley.
     2. Rainieri, C., & Fabbrocino, G. (2014). *Operational Modal Analysis of Civil Engineering Structures*. Springer.
-    3. Peeters, B., & De Roeck, G. (2001). Stochastic System Identification for Operational Modal Analysis: A Review.
+    3. Peeters, B., & De Roeck, G. (2001). *Stochastic System Identification for Operational Modal Analysis: A Review*.
        Journal of Dynamic Systems, Measurement, and Control, 123(4), 659-667.
-    4. Brincker, R., Zhang, L., & Andersen, P. (2000). Modal identification from ambient responses using frequency domain decomposition.
-       Proceedings of the 18th Int. Modal Analysis Conference (IMAC), San Antonio, Texas.
+    4. Brincker, R., Zhang, L., & Andersen, P. (2000). *Modal identification from ambient responses using frequency domain decomposition*.
+       In Proceedings of the 18th Int. Modal Analysis Conference (IMAC), San Antonio, Texas.
     5. Au, S. K. (2017). *Operational Modal Analysis: Modeling, Bayesian Inference, Uncertainty Laws*. Springer.
 
     **Feedback & Collaboration**  
@@ -634,7 +965,7 @@ def main():
     <hr/>
     <div style="text-align:center; font-size:0.85rem; color:#666;">
     <p>Operational Modal Analysis Educational Tool<br/>
-    Developed by: Mohammad Talebi-Kalaleh | talebika@ualberta.ca</p>
+    Developed by: Mohammad Talebi-Kalaleh | <a href="mailto:talebika@ualberta.ca">talebika@ualberta.ca</a></p>
     </div>
     """, unsafe_allow_html=True)
 
