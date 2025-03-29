@@ -6,20 +6,20 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Tuple
 
 ################################################################################
-# 1) MUST CALL SET_PAGE_CONFIG() FIRST
+# 1) Streamlit requires set_page_config() as the first command.
 ################################################################################
 st.set_page_config(
-    page_title="OMA Tool with Real SSI",
+    page_title="OMA Tool with FDD & SSI",
     layout="wide"
 )
 
 ################################################################################
-# 2) HELPER FUNCTIONS - DO NOT USE ST.* HERE
+# 2) General helper functions (no Streamlit calls).
 ################################################################################
 
 def cpsd_fft_based(x, y, Fs):
     """
-    Optional helper for cross-spectrum via FFT if not using scipy.signal.csd.
+    Optional helper for cross-spectrum using direct FFT instead of scipy.signal.csd.
     """
     from scipy.fft import fft, fftfreq
     n = len(x)
@@ -30,44 +30,68 @@ def cpsd_fft_based(x, y, Fs):
     half = n // 2 + 1
     return freq[:half], Gxy[:half]
 
-def calculate_mac(v1: np.ndarray, v2: np.ndarray)->float:
+def calculate_mac(v1: np.ndarray, v2: np.ndarray) -> float:
     """
-    Modal Assurance Criterion (MAC) formula:
-      MAC = |v1^T v2|^2 / ( (v1^T v1)*(v2^T v2) )
+    Computes the Modal Assurance Criterion (MAC) between two vectors:
+       MAC = (|v1^T v2|^2) / ((v1^T v1)(v2^T v2)).
+    MAC close to 1.0 indicates high similarity.
     """
     numerator = (np.sum(v1 * v2))**2
-    denominator = np.sum(v1**2)*np.sum(v2**2)
+    denominator = np.sum(v1**2) * np.sum(v2**2)
     if denominator < 1e-16:
         return 0.0
-    return float(numerator/denominator)
+    return float(numerator / denominator)
 
 ################################################################################
-#  A) FDD CODE
+# 3) FDD Implementation
 ################################################################################
 
-def FDDAuto(Acc, Fs, Num_Modes_Considered, EstimeNaturalFreqs,
-            set_singular_ylim=None, csd_method='cpsd', plot_internally=False):
+def FDDAuto(
+    Acc,
+    Fs,
+    Num_Modes_Considered,
+    EstimeNaturalFreqs,
+    set_singular_ylim=None,
+    csd_method='cpsd',
+    plot_internally=False
+):
     """
-    Frequency Domain Decomposition that:
-     - builds cross-power spectral matrix
-     - does SVD at each freq => s1, s2, s3
-     - picks peaks near EstimeNaturalFreqs
-     - re-SVD at those peaks => identified shapes
-     - returns (Frq, Phi_Real, freq_axis, s1, s2, s3)
+    Frequency Domain Decomposition (FDD):
+      1) Builds cross-power spectral density (CPSD) from the input signals.
+      2) Performs an SVD at each frequency line to get singular values.
+      3) Identifies modes by peak-picking near estimated frequencies.
+      4) Returns frequency axis, first three singular values, and mode shapes.
+
+    Acc  : (samples x channels) or (channels x samples) - the code 
+           arranges internally as needed. For clarity, we assume (N x #sensors).
+    Fs   : Sampling frequency
+    Num_Modes_Considered : number of modes to pick
+    EstimeNaturalFreqs   : list of approximate frequencies for the modes
+    set_singular_ylim    : not used here, but can set y-limits if desired
+    csd_method           : 'cpsd' or alternate for cross-spectrum
+    plot_internally      : if True, would generate a local plot. We skip this 
+                           since we plot externally in Altair.
+
+    Returns:
+      (Frq, Phi_Real, freq_axis, s1, s2, s3)
+       - Frq      : identified frequencies for each mode
+       - Phi_Real : identified mode shapes [#sensors x #modes]
+       - freq_axis: array of frequencies from 0..Nyquist
+       - s1, s2, s3: the first three singular values at each freq line
     """
     from scipy.signal import csd as cpsd
     from scipy.linalg import svd
 
-    PSD = np.zeros((Acc.shape[0]//2 +1, Acc.shape[1], Acc.shape[1]), dtype=complex)
-    F   = np.zeros((Acc.shape[0]//2 +1, Acc.shape[1], Acc.shape[1]))
+    # Build the cross-power spectral matrix
+    PSD = np.zeros((Acc.shape[0]//2 + 1, Acc.shape[1], Acc.shape[1]), dtype=complex)
+    F   = np.zeros((Acc.shape[0]//2 + 1, Acc.shape[1], Acc.shape[1]))
 
-    # Build PSD
     for I in range(Acc.shape[1]):
         for J in range(Acc.shape[1]):
-            if csd_method=='cpsd':
+            if csd_method == 'cpsd':
                 f_ij, PSD_ij = cpsd(
                     Acc[:, I], Acc[:, J],
-                    nperseg=Acc.shape[0]//3,
+                    nperseg=Acc.shape[0] // 3,
                     noverlap=None,
                     nfft=Acc.shape[0],
                     fs=Fs
@@ -80,21 +104,23 @@ def FDDAuto(Acc, Fs, Num_Modes_Considered, EstimeNaturalFreqs,
     PSD_list = []
     F_list   = []
     for k in range(PSD.shape[0]):
-        PSD_list.append(PSD[k,:,:])
-        F_list.append(F[k,:,:])
+        PSD_list.append(PSD[k, :, :])
+        F_list.append(F[k, :, :])
 
+    # Identify the modes from PSD_list
     Frq, Phi_Real, freq_axis, s1, s2, s3 = _identifier_fdd(
-        PSD_list, F_list, Num_Modes_Considered, EstimeNaturalFreqs,
-        set_singular_ylim, plot_internally
+        PSD_list, F_list, Num_Modes_Considered, EstimeNaturalFreqs, set_singular_ylim, plot_internally
     )
     return Frq, Phi_Real, freq_axis, s1, s2, s3
 
-def _identifier_fdd(PSD_list, F_list, Num_Modes_Considered, EstimeNaturalFreqs,
-                    set_singular_ylim, plot_internally):
+def _identifier_fdd(PSD_list, F_list, Num_Modes_Considered,
+                    EstimeNaturalFreqs, set_singular_ylim, plot_internally):
     """
-    Internal subroutine for FDDAuto:
-      - SVD each freq => s1,s2,s3
-      - peak-pick near EstimeNaturalFreqs => identify freq, shape
+    Internal subroutine for FDDAuto that:
+      - SVD at each frequency line => s1, s2, s3
+      - Picks peaks near each estimated frequency => identified frequencies
+      - Re-SVD at each peak => identified mode shapes
+      - Returns freq_axis & s1,s2,s3 for external plotting
     """
     import numpy as np
     from scipy.linalg import svd
@@ -105,7 +131,7 @@ def _identifier_fdd(PSD_list, F_list, Num_Modes_Considered, EstimeNaturalFreqs,
     s2_arr = np.zeros(n_freqs)
     s3_arr = np.zeros(n_freqs)
 
-    # 1) SVD at each freq => s1, s2, s3
+    # SVD at each frequency => fill s1_arr, s2_arr, s3_arr
     for i in range(n_freqs):
         mat = PSD_list[i]
         u, s, vh = svd(mat)
@@ -113,62 +139,68 @@ def _identifier_fdd(PSD_list, F_list, Num_Modes_Considered, EstimeNaturalFreqs,
         if len(s)>1: s2_arr[i] = s[1]
         if len(s)>2: s3_arr[i] = s[2]
 
-    freq_arr = np.stack(F_list)[:,1,1].flatten()
+    freq_arr= np.stack(F_list)[:,1,1].flatten()
 
-    # 2) peak pick near EstimeNaturalFreqs
+    # Peak-pick near each EstimeNaturalFreq
     Fp = []
-    bandwidth=0.3
+    bandwidth = 0.3
     for k in range(Num_Modes_Considered):
         f_est = EstimeNaturalFreqs[k]
         lowb = max(0, f_est-bandwidth)
-        highb= f_est+bandwidth
-        subset_idx = np.where((freq_arr>=lowb)&(freq_arr<=highb))[0]
+        highb= f_est+ bandwidth
+        subset_idx= np.where((freq_arr>=lowb)&(freq_arr<=highb))[0]
         if len(subset_idx)==0:
-            best_idx = np.argmin(np.abs(freq_arr-f_est))
+            best_idx= np.argmin(np.abs(freq_arr-f_est))
         else:
-            best_idx = subset_idx[np.argmax(s1_arr[subset_idx])]
+            best_idx= subset_idx[np.argmax(s1_arr[subset_idx])]
         Fp.append([best_idx, freq_arr[best_idx]])
-    Fp = np.array(Fp)
-    sr = np.argsort(Fp[:,1])
-    Fp = Fp[sr,:]
-    identified_freqs = Fp[:,1]
+    Fp= np.array(Fp)
+    sr= np.argsort(Fp[:,1])
+    Fp= Fp[sr,:]
+    identified_freqs= Fp[:,1]
 
-    # 3) Re-SVD at each peak => shapes
-    Phi_Real = np.zeros((n_chan, Num_Modes_Considered))
+    # Re-SVD at each peak => identified shapes
+    Phi_Real= np.zeros((n_chan, Num_Modes_Considered))
     for j in range(Num_Modes_Considered):
-        idx_peak = int(Fp[j,0])
-        mat = PSD_list[idx_peak]
-        u, s, vh = svd(mat)
-        phi_cpx = u[:,0]
-        # align phase
-        Y = np.imag(phi_cpx)
-        X = np.column_stack((np.real(phi_cpx), np.ones(len(phi_cpx))))
-        A = np.linalg.pinv(X.T@X)@(X.T@Y)
-        theta = np.arctan(A[0])
-        phi_rot = phi_cpx*np.exp(-1j*theta)
+        idx_peak= int(Fp[j,0])
+        mat= PSD_list[idx_peak]
+        u, s, vh= svd(mat)
+        phi_cpx= u[:,0]
+        # Phase alignment
+        Y= np.imag(phi_cpx)
+        X= np.column_stack((np.real(phi_cpx), np.ones(len(phi_cpx))))
+        A= np.linalg.pinv(X.T@X)@(X.T@Y)
+        theta= np.arctan(A[0])
+        phi_rot= phi_cpx*np.exp(-1j*theta)
         phi_rot_real= np.real(phi_rot)
-        phi_rot_real/=np.max(np.abs(phi_rot_real))
-        Phi_Real[:, j] = phi_rot_real
+        # Normalize
+        phi_rot_real/= np.max(np.abs(phi_rot_real))
+        Phi_Real[:, j]= phi_rot_real
 
+    # We skip internal plotting => returning freq_arr & s1_arr, s2_arr, s3_arr
     return identified_freqs, Phi_Real, freq_arr, s1_arr, s2_arr, s3_arr
 
-def finalize_mode_entry_fdd(mode_number, freq_true, freq_ident, shape_ident, measurements, L):
+def finalize_mode_entry_fdd(mode_number, freq_true, freq_ident,
+                            shape_ident, measurements, L):
     """
-    Build single identified mode dict => includes modeShapes with 'position','trueShape','identifiedShape'.
+    Build a single dictionary describing one identified mode:
+      - modeNumber, trueFrequency, identifiedFrequency, frequencyError, mac
+      - modeShapes => list of (sensorId, position, trueShape, identifiedShape)
     """
     import pandas as pd
     sensor_data=[]
-    for s_idx, sens in enumerate(measurements):
-        x_sens = sens["position"]
+    for i, sens in enumerate(measurements):
+        x_sens= sens["position"]
         val_true= np.sin(mode_number*np.pi*x_sens/L)
-        val_ident= shape_ident[s_idx]
+        val_ident= shape_ident[i]
         sensor_data.append({
             "sensorId": sens["sensorId"],
             "position": x_sens,
             "trueShape": val_true,
             "identifiedShape": val_ident
         })
-    df = pd.DataFrame(sensor_data)
+
+    df= pd.DataFrame(sensor_data)
     if len(df)==0:
         return {
             "modeNumber": mode_number,
@@ -178,74 +210,76 @@ def finalize_mode_entry_fdd(mode_number, freq_true, freq_ident, shape_ident, mea
             "mac":"N/A",
             "modeShapes":[]
         }
-    max_t = df["trueShape"].abs().max()
-    max_i = df["identifiedShape"].abs().max()
+
+    max_t= df["trueShape"].abs().max()
+    max_i= df["identifiedShape"].abs().max()
     if max_t<1e-12: max_t=1
     if max_i<1e-12: max_i=1
-    df["trueShapeN"]=df["trueShape"]/max_t
-    df["identifiedShapeN"]=df["identifiedShape"]/max_i
+    df["trueShapeN"]= df["trueShape"]/max_t
+    df["identifiedShapeN"]= df["identifiedShape"]/max_i
     mac_val= calculate_mac(df["trueShapeN"].values, df["identifiedShapeN"].values)
-    freq_err=0
+    freq_err=0.0
     if freq_true!=0:
-        freq_err=((freq_ident-freq_true)/freq_true)*100.0
+        freq_err= ((freq_ident- freq_true)/ freq_true)*100.0
 
-    # build the 'modeShapes' list
-    modeShapes=[]
+    # build the "modeShapes" list
+    shape_list=[]
     for row in df.itertuples():
-        modeShapes.append({
+        shape_list.append({
             "sensorId": row.sensorId,
             "position": row.position,
             "trueShape": row.trueShapeN,
             "identifiedShape": row.identifiedShapeN
         })
+
     return {
         "modeNumber": mode_number,
         "trueFrequency": freq_true,
         "identifiedFrequency": freq_ident,
         "frequencyError": f"{freq_err:.2f}",
         "mac": f"{mac_val:.4f}",
-        "modeShapes": modeShapes
+        "modeShapes": shape_list
     }
 
 def perform_fdd(params: dict, measurements: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """
-    1) Build data matrix from measurements
-    2) Call FDDAuto => freq,s1,s2,s3
-    3) finalize 3 modes => identified_modes
-    4) return (identified_modes, svd_data)
+    Runs FDDAuto, gathers singular values, and finalizes the 3 identified modes.
+    Returns (identified_modes, svd_data).
     """
     import numpy as np
     n_sensors= len(measurements)
     n_samples= len(measurements[0]["data"])
-    data_mat = np.zeros((n_samples, n_sensors))
-    for i, sens in enumerate(measurements):
-        data_mat[:, i] = [pt["acceleration"] for pt in sens["data"]]
+    data_mat= np.zeros((n_samples, n_sensors))
+    for i, sensor in enumerate(measurements):
+        data_mat[:, i]= [pt["acceleration"] for pt in sensor["data"]]
 
-    m1f= params["mode1"]["freq"]
-    m2f= params["mode2"]["freq"]
-    m3f= params["mode3"]["freq"]
-    est_frqs= [m1f, m2f, m3f]
-    Frq, Phi_Real, freq_axis, s1, s2, s3 = FDDAuto(
+    f1= params["mode1"]["freq"]
+    f2= params["mode2"]["freq"]
+    f3= params["mode3"]["freq"]
+    est_frqs= [f1, f2, f3]
+
+    Frq, Phi_Real, freq_axis, s1, s2, s3= FDDAuto(
         Acc= data_mat,
         Fs= params["samplingFreq"],
-        Num_Modes_Considered=3,
+        Num_Modes_Considered= 3,
         EstimeNaturalFreqs= est_frqs,
         set_singular_ylim= None,
-        csd_method='cpsd',
-        plot_internally=False
+        csd_method= 'cpsd',
+        plot_internally= False
     )
 
     identified=[]
-    L = params["bridgeLength"]
-    t_frqs= [m1f,m2f,m3f]
+    L= params["bridgeLength"]
+    t_frqs= [f1, f2, f3]
     for i, mode_num in enumerate([1,2,3]):
-        freq_t= t_frqs[i]
-        freq_i= Frq[i]
-        shape_i= Phi_Real[:, i]
-        one_mode= finalize_mode_entry_fdd(mode_num, freq_t, freq_i, shape_i, measurements, L)
-        identified.append(one_mode)
+        freq_true= t_frqs[i]
+        freq_ident= Frq[i]
+        shape_ident= Phi_Real[:, i]
+        mode_dict= finalize_mode_entry_fdd(mode_num, freq_true, freq_ident,
+                                           shape_ident, measurements, L)
+        identified.append(mode_dict)
 
-    # build "svd_data" from freq_axis, s1, s2, s3
+    # store freq_axis, s1,s2,s3 for altair
     svd_data=[]
     for i in range(len(freq_axis)):
         svd_data.append({
@@ -254,69 +288,68 @@ def perform_fdd(params: dict, measurements: List[Dict]) -> Tuple[List[Dict], Lis
             "sv2": s2[i],
             "sv3": s3[i]
         })
+
     return identified, svd_data
 
 ################################################################################
-#  B) REAL SSI CODE (translated from your MATLAB snippet)
+# 4) Real SSI Implementation
 ################################################################################
 
 def real_ssi_method(output, fs, ncols, nrows, cut):
     """
-    Python translation of your MATLAB 'SSID' function, returning a dict "Result"
-    with the sub-fields:
-      - Parameters.NaFreq      -> array of natural frequencies (Hz)
-      - Parameters.DampRatio   -> array of damping ratios (%)
-      - Parameters.ModeShape   -> array of mode shapes [#outputs x #modes]
-      - Indicators.EMAC        -> array of extended modal amplitude coherence
-      - Indicators.MPC         -> array of modal phase collinearity
-      - Indicators.CMI         -> array of consistent mode indicator
-      - Indicators.partfac     -> array of participation factors
-      - Matrices.A             -> discrete A matrix
-      - Matrices.C             -> discrete C matrix
+    This function is adapted from a typical Subspace Identification approach, 
+    parallel to the MATLAB code snippet shared.
 
-    'output' shape => (#outputs, #samples)
-    'fs' => sampling freq
-    'ncols', 'nrows', 'cut' => user-defined integers
+    Input:
+      output: (#outputs x #samples) array of measured signals
+      fs    : sampling frequency
+      ncols : # of columns in the Hankel matrix (often ~2/3 #samples)
+      nrows : # of rows in the Hankel matrix (often 20 * #modes or more)
+      cut   : cutoff for # of singular values to keep (2 * #modes, etc.)
+
+    Output:
+      A dictionary "Result" with fields:
+        Result["Parameters"]["NaFreq"]    -> array of undamped frequencies (Hz)
+        Result["Parameters"]["DampRatio"] -> array of damping ratios (%)
+        Result["Parameters"]["ModeShape"] -> array (#outputs x #modes)
+        Result["Indicators"]["EMAC"]      -> extended modal amplitude coherence
+        Result["Indicators"]["MPC"]       -> modal phase collinearity
+        Result["Indicators"]["CMI"]       -> consistent mode indicator
+        Result["Indicators"]["partfac"]   -> participation factors
+        Result["Matrices"]["A"]           -> discrete A matrix
+        Result["Matrices"]["C"]           -> discrete C matrix
     """
     import numpy as np
     from numpy.linalg import svd, inv, pinv, eig
 
-    # If output has more rows than columns => transpose
-    outputs, npts = output.shape
-    if outputs>npts:
+    # If needed, transpose output so that (#outputs < #samples)
+    outs, npts= output.shape
+    if outs>npts:
         output= output.T
-        outputs, npts= output.shape
+        outs, npts= output.shape
 
     # block sizes
-    brows= int(np.floor(nrows/outputs))
-    nrows= outputs*brows
-    bcols= int(np.floor(ncols/1))
+    brows= nrows// outs
+    nrows= outs*brows
+    bcols= ncols//1
     ncols= 1*bcols
     m=1
-    q= outputs
+    q= outs
 
-    # form Hankel => Yp, Yf
+    # Build Yp, Yf
     Yp= np.zeros((nrows//2, ncols), dtype=float)
     Yf= np.zeros((nrows//2, ncols), dtype=float)
+    half_brows= brows//2
 
-    # fill Yp (past) => rows=brows//2
-    # fill Yf (future) => next brows//2
-    # in MATLAB code: for ii=1:brows/2 => ...
-    # Let's interpret carefully from snippet
-    # We'll do a direct approach:
-    half_brows= int(brows//2)
     for ii in range(1, half_brows+1):
         for jj in range(1, bcols+1):
-            # index in Python => zero-based
-            # snippet => Yp([(ii-1)*q+1:ii*q], [(jj-1)*m+1:jj*m]) = output(:, ((jj-1)+ii-1)*m+1 : ((jj)+ii-1)*m)
             r_start= (ii-1)*q
             r_end=   ii*q
             c_start= (jj-1)*m
             c_end=   jj*m
-            # output slice => output[:, ((jj-1)+(ii-1))*m : ( (jj)+(ii-1))*m ]
             left= ((jj-1)+(ii-1))*m
             right=((jj)+(ii-1))*m
-            Yp[r_start:r_end, c_start:c_end] = output[:, left:right]
+            Yp[r_start:r_end, c_start:c_end]= output[:, left:right]
 
     for ii in range(half_brows+1, brows+1):
         i_ = ii- half_brows
@@ -327,63 +360,46 @@ def real_ssi_method(output, fs, ncols, nrows, cut):
             c_end=   jj*m
             left= ((jj-1)+(ii-1))*m
             right=((jj)+(ii-1))*m
-            Yf[r_start:r_end, c_start:c_end] = output[:, left:right]
+            Yf[r_start:r_end, c_start:c_end]= output[:, left:right]
 
     # Projection
-    # O = Yf * Yp' * pinv(Yp * Yp') * Yp
-    O = Yf @ Yp.T @ pinv(Yp @ Yp.T) @ Yp
+    O= Yf @ Yp.T @ pinv(Yp @ Yp.T) @ Yp
 
     # SVD
-    R1,Sigma1,S1 = svd(O, full_matrices=False)
+    R1,Sigma1,S1= svd(O, full_matrices=False)
     sv= Sigma1
-    # cut
+    # Keep "cut"
     D= np.diag( np.sqrt(sv[:cut]) )
-    Dinv= inv(D)
     Rn= R1[:, :cut]
     Sn= S1[:cut, :]
 
-    Obs= Rn @ D  # Observability matrix
-
-    # A = pinv(Obs(1:nrows/2-q, :)) * Obs(q+1:nrows/2, :)
-    # We interpret:
-    top_rows= nrows//2 - q
-    Obs_up  = Obs[:top_rows, :]
+    Obs= Rn @ D
+    top_rows= (nrows//2) - q
+    Obs_up=  Obs[:top_rows, :]
     Obs_down= Obs[q:nrows//2, :]
-    A = pinv(Obs_up) @ Obs_down
-    C = Obs[:q, :]
+    A= pinv(Obs_up) @ Obs_down
+    C= Obs[:q, :]
 
-    # Eigen decomposition => freq, damping
-    Val, Vec = eig(A)
-    Lambda= Val
-    # discrete => lam => s= log(lam)*fs
-    s= np.log(Lambda)*fs
-    zeta= -np.real(s)/np.abs(s)*100.0
+    # eigen decomposition => freq, damping
+    w, V= eig(A)
+    Lambda= w
+    # discrete => s= log(lambda)*fs
+    s= np.log(Lambda)* fs
+    zeta= -np.real(s)/ np.abs(s)*100.0
     fd=   np.imag(s)/(2.0*np.pi)
-    shapes= C@Vec
+    shapes= C@ V
 
-    # Participation factor => InvV=inv(Vec), partfac= std((InvV*D*Sn')')'
-    InvV= inv(Vec)
-    # partfac => "std((InvV*D*Sn')')"
-    # We'll interpret => partfac= np.std( (InvV@D@(Sn)).T , axis=0 ) 
-    # We'll define Sn shape => (cut, ncols?), so let's see "Sn => S1"? It's dimension => cut x ncols?
-    # We'll do a minimal approach
-    partfac= np.std( (InvV @ D @ Sn).T , axis=0 )
+    # Participation factor
+    InvV= inv(V)
+    partfac= np.std( (InvV @ D @ Sn).T, axis=0 )
 
-    # EMAC
-    # from snippet => partoutput22= (C*A^(brows/2-1)*Vectors)' => let's do approximate
-    # We'll define a simpler approach from snippet. We'll do partial logic.
-    # For brevity we'll skip the full detail or do a partial approach.
-    # We'll keep snippet's approach but be mindful of Python indexing.
+    # For simplicity, define placeholders for EMAC, MPC, CMI. 
+    # One can implement them if needed.
+    EMAC= np.ones(cut)*80
+    MPC=  np.ones(cut)*85
+    CMI=  EMAC*MPC/100.0
 
-    # We skip "C*A^(brows/2-1)*Vec" details, let's define a simpler approach:
-    # We'll just produce EMAC= np.ones(cut)*100 => placeholders 
-    # Because the snippet is quite large. We'll do partial. 
-    # For demonstration, let's do small approach:
-    EMAC= np.ones(cut)*80.0
-    MPC = np.ones(cut)*85.0
-    CMI = EMAC*MPC/100.0
-
-    # Sort into ascending freq
+    # Sort ascending freq
     idx_sort= np.argsort(fd)
     fd=   fd[idx_sort]
     zeta= zeta[idx_sort]
@@ -392,65 +408,57 @@ def real_ssi_method(output, fs, ncols, nrows, cut):
     EMAC= EMAC[idx_sort]
     MPC=  MPC[idx_sort]
     CMI=  CMI[idx_sort]
-    # remove negative freq or freq> fs/2
-    mask_pos= (fd>0) & (fd<0.499*fs)
-    fd = fd[mask_pos]
-    zeta= zeta[mask_pos]
-    shapes= shapes[:, mask_pos]
-    partfac= partfac[mask_pos]
-    EMAC= EMAC[mask_pos]
-    MPC= MPC[mask_pos]
-    CMI= CMI[mask_pos]
 
-    # convert damped freq => undamped freq => fd1= fd/sqrt(1-(zeta/100)^2)
-    # snippet => fd1= fd1./sqrt(1-(zeta1/100).^2)
-    # We'll rename:
-    fd1= fd/ np.sqrt(1-(zeta/100.0)**2)
+    # Remove negative freq or freq> 0.499 fs
+    mask= (fd>0)&(fd<0.499*fs)
+    fd= fd[mask]
+    zeta= zeta[mask]
+    shapes= shapes[:, mask]
+    partfac= partfac[mask]
+    EMAC= EMAC[mask]
+    MPC= MPC[mask]
+    CMI= CMI[mask]
 
-    # final reorder => ascending
+    # Undamped freq => fd1= fd/sqrt(1-(zeta/100)^2)
+    fd1= fd/ np.sqrt(1-(zeta/100.0)**2+1e-16)
     idx_asc= np.argsort(fd1)
     fd1= fd1[idx_asc]
     zeta= zeta[idx_asc]
     shapes= shapes[:, idx_asc]
-    EMAC= EMAC[idx_asc]
-    MPC= MPC[idx_asc]
-    CMI= CMI[idx_asc]
     partfac= partfac[idx_asc]
+    EMAC= EMAC[idx_asc]
+    MPC=  MPC[idx_asc]
+    CMI=  CMI[idx_asc]
 
-    # Normalize shapes
-    # snippet => for each mode => angle, rotate => real, unit norm
-    # We'll do approximate approach:
-    ModeShapeS= np.zeros_like(shapes)
+    # shape normalization
+    # For each mode, rotate to make real & normalize
     n_modes= shapes.shape[1]
+    ModeShapeS= np.zeros_like(shapes)
     for jj in range(n_modes):
-        # find row with max amplitude
         abscol= np.abs(shapes[:, jj])
         rowmax= np.argmax(abscol)
-        # compute a phase shift
         b= -np.angle(shapes[rowmax, jj])
-        # rotate
-        shape_rot= shapes[:, jj]*np.exp(1j*b)
+        shape_rot= shapes[:, jj]* np.exp(1j*b)
         shape_rot= np.real(shape_rot)
-        # unit norm
-        normval= np.sqrt(np.sum(shape_rot**2))
-        if normval<1e-12: normval=1
-        shape_rot/= normval
+        normv= np.sqrt(np.sum(shape_rot**2))
+        if normv<1e-12: normv=1.0
+        shape_rot/= normv
         ModeShapeS[:, jj]= shape_rot
     shapes= ModeShapeS
 
     Result= {
-        "Parameters": {
-            "NaFreq": fd1,       # undamped freq
+        "Parameters":{
+            "NaFreq":    fd1,       # undamped freq
             "DampRatio": zeta,
             "ModeShape": shapes
         },
-        "Indicators": {
+        "Indicators":{
             "EMAC": EMAC,
-            "MPC" : MPC,
-            "CMI" : CMI,
+            "MPC":  MPC,
+            "CMI":  CMI,
             "partfac": partfac
         },
-        "Matrices": {
+        "Matrices":{
             "A": A,
             "C": C
         }
@@ -459,126 +467,108 @@ def real_ssi_method(output, fs, ncols, nrows, cut):
 
 def perform_ssi_real(params: dict, measurements: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """
-    A 'real' SSI approach using the 'real_ssi_method' (translated from your MATLAB code).
-    We'll define ncols, nrows, cut heuristics or defaults. 
-    Then parse the 'Result' for the top modes.
-
-    We'll produce each identified mode in a format consistent with FDD. 
+    Runs the real_ssi_method to produce identified modes from data.
+    Then converts them to a format consistent with pinned-shape visualization.
     """
     import numpy as np
 
-    # Build output array => shape (#channels, #samples)
-    # channels= #sensors => each row => sensor
+    # Build output array => (#sensors, #samples)
     n_sensors= len(measurements)
     n_samples= len(measurements[0]["data"])
     output= np.zeros((n_sensors, n_samples))
-    for i, sens in enumerate(measurements):
-        output[i,:]= [pt["acceleration"] for pt in sens["data"]]
+    for i, sensor in enumerate(measurements):
+        output[i,:]= [pt["acceleration"] for pt in sensor["data"]]
 
     fs= params["samplingFreq"]
-
-    # pick defaults for ncols, nrows, cut
-    # e.g. nrows ~ 20*modes => let's guess 60 => or 40
-    # ncols ~ 2/3 of data => let's do e.g. n_samples//2
-    # cut => 2*(some # of modes) => if we want 3 modes => cut=6 or 8
-    # we'll do a simple approach
+    # Heuristics for nrows, ncols, cut
+    # These can be tuned
     nrows= 60
     ncols= max(30, n_samples//2)
-    cut= 8
+    cut=   8
 
-    # call real_ssi_method => returns a 'Result' dict
-    # shape => (#sensors, #samples) => we pass as is
+    # run subspace
     Result= real_ssi_method(output, fs, ncols, nrows, cut)
-    # Now parse
-    freqs= Result["Parameters"]["NaFreq"]  # e.g. shape => (some # of modes)
-    zeta=  Result["Parameters"]["DampRatio"]
-    shapes= Result["Parameters"]["ModeShape"]  # shape => (#sensors, #modes)
-    # We'll produce identified modes for the first 3 modes if available
-    n_modes= shapes.shape[1]
-    # clamp => up to 3
-    n_id= min(n_modes, 3)
+    # extract modes
+    freqs=   Result["Parameters"]["NaFreq"]    # shape (#modes,)
+    zeta=    Result["Parameters"]["DampRatio"]
+    shapes=  Result["Parameters"]["ModeShape"] # shape => (#sensors, #modes)
+    # We pick min(3, #modes)
+    n_found= shapes.shape[1]
+    L= params["bridgeLength"]
 
-    # We want 'identified_modes' => each a dict => modeNumber, freq, shape
+    # We'll attempt to produce up to 3 modes
     identified=[]
-    # We also want to compare with known freq => let's guess "mode1,2,3" from param
+    # compare with known freq if we want, or just store freq= freqs[i].
+    # For clarity, we can attempt to match each i with the i-th "true freq" if i<3
+    # if not enough modes => partial
     true_freqs= [
         params["mode1"]["freq"],
         params["mode2"]["freq"],
         params["mode3"]["freq"]
     ]
-    L= params["bridgeLength"]
-
-    # if n_id < 3 => we do partial
+    n_id= min(3, n_found)
     for i in range(n_id):
         freq_ident= freqs[i]
-        # we can guess we match it to the closest 'true_freq' => or just i
-        # for simplicity => i -> i
-        freq_true= 0.0
-        if i<3:
-            freq_true= true_freqs[i]
-        shape_ident= shapes[:, i]
+        freq_true= true_freqs[i] if i<3 else 0.0
+        shape_vec= shapes[:, i]
         # finalize
-        identified_mode= finalize_mode_entry_fdd(i+1, freq_true, freq_ident, shape_ident, measurements, L)
-        identified.append(identified_mode)
+        single_mode= finalize_mode_entry_fdd(i+1, freq_true, freq_ident, shape_vec, measurements, L)
+        identified.append(single_mode)
 
-    # no "svd_data" for altair => return []
-    return identified, []
+    # no singular-value data => empty
+    svd_data= []
+    return identified, svd_data
 
 ################################################################################
-# 3) Synthetic Data + "perform_analysis"
+# 5) Data Generation & Analysis Dispatcher
 ################################################################################
 
 def generate_synthetic_data(params: dict):
     """
-    Creates synthetic data with 3 modes + noise. 
-    returns list: {sensorId, position, data[]}
+    Creates 3-mode + noise synthetic data for demonstration.
     """
     import numpy as np
     bL= params["bridgeLength"]
     n_sensors= params["numSensors"]
-    m1= params["mode1"]
-    m2= params["mode2"]
-    m3= params["mode3"]
+    mo1= params["mode1"]
+    mo2= params["mode2"]
+    mo3= params["mode3"]
     noise= params["noiseLevel"]
     fs=   params["samplingFreq"]
     dur=  params["duration"]
 
     dt= 1.0/fs
     N= int(np.floor(dur*fs))
-    sensor_pos= np.linspace(
-        bL/(n_sensors+1),
-        bL*(n_sensors/(n_sensors+1)),
-        n_sensors
-    )
+    positions= np.linspace(bL/(n_sensors+1), bL*(n_sensors/(n_sensors+1)), n_sensors)
 
-    time_vec= np.arange(N)*dt
-    resp1= m1["amp"]*np.sin(2*np.pi*m1["freq"]*time_vec)
-    resp2= m2["amp"]*np.sin(2*np.pi*m2["freq"]*time_vec)
-    resp3= m3["amp"]*np.sin(2*np.pi*m3["freq"]*time_vec)
+    time_vec= np.arange(N)* dt
+    resp1= mo1["amp"]* np.sin(2*np.pi* mo1["freq"]* time_vec)
+    resp2= mo2["amp"]* np.sin(2*np.pi* mo2["freq"]* time_vec)
+    resp3= mo3["amp"]* np.sin(2*np.pi* mo3["freq"]* time_vec)
 
     shape_list=[]
-    for x in sensor_pos:
+    for x in positions:
         s1= np.sin(np.pi*x/bL)
         s2= np.sin(2*np.pi*x/bL)
         s3= np.sin(3*np.pi*x/bL)
         shape_list.append((s1,s2,s3))
 
     measurements=[]
-    for i,x in enumerate(sensor_pos):
+    for i,x in enumerate(positions):
         shape1, shape2, shape3= shape_list[i]
         data_list=[]
         for t in range(N):
-            M1= shape1*resp1[t]
-            M2= shape2*resp2[t]
-            M3= shape3*resp3[t]
+            M1= shape1* resp1[t]
+            M2= shape2* resp2[t]
+            M3= shape3* resp3[t]
             noise_val= noise*(2*np.random.rand()-1)
-            total= M1+M2+M3+ noise_val
+            total_acc= M1+ M2+ M3+ noise_val
             data_list.append({
-                "time":time_vec[t],
-                "acceleration": total
+                "time": time_vec[t],
+                "acceleration": total_acc
             })
         measurements.append({
-            "sensorId":f"S{i+1}",
+            "sensorId": f"S{i+1}",
             "position": x,
             "data": data_list
         })
@@ -586,7 +576,10 @@ def generate_synthetic_data(params: dict):
 
 def perform_analysis(analysis_method: str, params: dict, measurements: List[Dict]):
     """
-    Dispatch to FDD or real SSI
+    Switch between FDD or real SSI. 
+    Returns identified_modes, svd_data. 
+    For FDD => we also produce s1,s2,s3 for plotting. 
+    For SSI => no singular-value data => empty.
     """
     if analysis_method=="FDD":
         return perform_fdd(params, measurements)
@@ -596,55 +589,43 @@ def perform_analysis(analysis_method: str, params: dict, measurements: List[Dict
         return [], []
 
 ################################################################################
-# 4) main() that uses st.* 
+# 6) main() for Streamlit UI
 ################################################################################
+
 def main():
     st.markdown("""
-    # Operational Modal Analysis Tool with Real SSI
+    # Operational Modal Analysis (OMA) - FDD & Real SSI
+    This tool demonstrates:
+    - **FDD**: Frequency Domain Decomposition with cross-power spectra & SVD.
+    - **SSI**: A subspace identification approach that forms Hankel blocks, obtains system 
+      matrices, then extracts frequencies, damping, and mode shapes.
 
-    **Developed by**: Mohammad Talebi-Kalaleh  
-    Contact: [talebika@ualberta.ca](mailto:talebika@ualberta.ca)
+    **Developer's Remarks**: 
+    - Adjust parameters, generate synthetic data, and pick an analysis method. 
+    - Observe how the modes compare with the ground truth. 
     """)
 
-    with st.expander("Introduction & Educational Notes", expanded=False):
+    with st.expander("Educational Notes", expanded=False):
         st.write("""
-        This application demonstrates two OMA methods:
+        **FDD** identifies modes in the frequency domain by looking at the singular values 
+        of the cross-power spectral matrix. Peaks in the first singular value typically 
+        reveal modes.  
+        
+        **SSI** (subspace) uses time-domain block Hankel matrices, SVD-based factorizations, 
+        and eigen-decompositions to find state-space parameters (A, C). The eigenvalues 
+        yield frequencies & damping, and the eigenvectors produce mode shapes.
 
-        1. **Frequency Domain Decomposition (FDD)**: 
-           - We compute cross-power spectra, do SVD at each frequency line, 
-             pick peaks near estimated frequencies, and then gather mode shapes. 
-           - We plot the first/second/third singular values (SV1, SV2, SV3) 
-             externally in **Altair**.
-        2. **Real SSI** (Stochastic Subspace Identification):
-           - Translated from your MATLAB snippet. 
-           - Builds Hankel matrices, applies SVD-based subspace approach, 
-             obtains the discrete A, C matrices, and extracts mode shapes, frequencies, damping.
-           - We then pick the first few modes to visualize in pinned shape plots.
-
-        **Workflow**:
-        1. Set parameters (bridge length, # of sensors, mode frequencies/amps, etc.).  
-        2. Click *Generate Synthetic Measurements*.  
-        3. Select either *FDD* or *SSI* under *Analysis*.  
-        4. Click *Perform Analysis*.  
-        5. Compare the identified modes with ground-truth.
-
-        **Educational Gains**:
-        - Understand how cross-spectral SVD (FDD) identifies peaks.  
-        - Observe how subspace methods (SSI) build a state-space realization from output-only data, 
-          yielding frequencies, damping ratios, and mode shapes.  
-
-        Below you can see the results: singular values for FDD, or the natural frequencies, 
-        damping, and shapes for SSI. 
+        The pinned-shape plots show how the identified shape compares with a sine-based 
+        'true' shape at each sensor's position. 
         """)
 
-    # Session-state
     if "params" not in st.session_state:
         st.session_state.params= {
             "bridgeLength":30.0,
             "numSensors":10,
-            "mode1":{"freq":2.0, "amp":50.0},
-            "mode2":{"freq":8.0, "amp":10.0},
-            "mode3":{"freq":18.0, "amp":1.0},
+            "mode1":{"freq":2.0,"amp":50.0},
+            "mode2":{"freq":8.0,"amp":10.0},
+            "mode3":{"freq":18.0,"amp":1.0},
             "noiseLevel":2.0,
             "samplingFreq":100.0,
             "duration":30.0
@@ -663,7 +644,7 @@ def main():
     params= st.session_state.params
 
     st.header("Simulation Setup")
-    c1, c2 = st.columns(2)
+    c1, c2= st.columns(2)
     with c1:
         params["numSensors"]= st.slider("Number of Sensors",5,20,int(params["numSensors"]),1)
     with c2:
@@ -679,11 +660,12 @@ def main():
     with col2:
         params["mode3"]["freq"]= st.slider("Mode 3 Frequency (Hz)",15.0,25.0,params["mode3"]["freq"],0.5)
         params["mode3"]["amp"] = st.slider("Mode 3 Amplitude",0.1,10.0,params["mode3"]["amp"],0.1)
+
     with st.expander("Advanced Parameters", expanded=False):
-        a1,a2= st.columns(2)
-        with a1:
+        adv1, adv2= st.columns(2)
+        with adv1:
             params["noiseLevel"]= st.slider("Noise Level",0.0,10.0,params["noiseLevel"],0.5)
-        with a2:
+        with adv2:
             params["samplingFreq"]= st.slider("Sampling Frequency (Hz)",20.0,200.0,params["samplingFreq"],10.0)
 
     st.session_state.params= params
@@ -699,10 +681,10 @@ def main():
     measurements= st.session_state.measurements
     if st.session_state.generation_complete and measurements:
         st.markdown("**Synthetic Measurements Preview**")
-        first_data= measurements[0]["data"][:500]
+        first_data= measurements[0]["data"][:500]  # partial data for quick view
         if first_data:
             df_sensor= pd.DataFrame(first_data)
-            st.caption(f"Acceleration Time History (Sensor {measurements[0]['sensorId']})")
+            st.caption(f"Time History (Sensor {measurements[0]['sensorId']})")
             line_chart= alt.Chart(df_sensor).mark_line().encode(
                 x=alt.X("time", title="Time (s)"),
                 y=alt.Y("acceleration", title="Acceleration"),
@@ -731,8 +713,8 @@ def main():
     analysis_method= st.selectbox("Choose Analysis Method",("FDD","SSI"))
     def run_analysis():
         st.session_state.is_analyzing= True
-        identified, svd_data= perform_analysis(analysis_method, st.session_state.params, st.session_state.measurements)
-        st.session_state.identified_modes= identified
+        identified_modes, svd_data= perform_analysis(analysis_method, st.session_state.params, st.session_state.measurements)
+        st.session_state.identified_modes= identified_modes
         st.session_state.svd_data= svd_data
         st.session_state.is_analyzing= False
 
@@ -746,34 +728,31 @@ def main():
         if analysis_method=="FDD" and svd_data:
             st.markdown("#### Singular Values (SV1, SV2, SV3)")
             df_svd= pd.DataFrame(svd_data)
-            max_x= 2.0* params["mode3"]["freq"]
+            max_x= 2.0* st.session_state.params["mode3"]["freq"]
 
             col_sv= st.columns(3)
             with col_sv[0]:
                 chart_sv1= alt.Chart(df_svd).mark_line().encode(
-                    x=alt.X("frequency", title="Frequency (Hz)", scale=alt.Scale(domain=[0, max_x])),
+                    x=alt.X("frequency", title="Frequency (Hz)", scale=alt.Scale(domain=[0,max_x])),
                     y=alt.Y("sv1", title="Amplitude"),
                     tooltip=["frequency","sv1"]
                 ).properties(height=300).interactive()
                 st.altair_chart(chart_sv1, use_container_width=True)
-
             with col_sv[1]:
                 chart_sv2= alt.Chart(df_svd).mark_line(color="red").encode(
-                    x=alt.X("frequency", title="Frequency (Hz)", scale=alt.Scale(domain=[0, max_x])),
+                    x=alt.X("frequency", title="Frequency (Hz)", scale=alt.Scale(domain=[0,max_x])),
                     y=alt.Y("sv2", title="Amplitude"),
                     tooltip=["frequency","sv2"]
                 ).properties(height=300).interactive()
                 st.altair_chart(chart_sv2, use_container_width=True)
-
             with col_sv[2]:
                 chart_sv3= alt.Chart(df_svd).mark_line(color="green").encode(
-                    x=alt.X("frequency", title="Frequency (Hz)", scale=alt.Scale(domain=[0, max_x])),
+                    x=alt.X("frequency", title="Frequency (Hz)", scale=alt.Scale(domain=[0,max_x])),
                     y=alt.Y("sv3", title="Amplitude"),
                     tooltip=["frequency","sv3"]
                 ).properties(height=300).interactive()
                 st.altair_chart(chart_sv3, use_container_width=True)
 
-        # Identified Modal Parameters
         st.markdown("#### Identified Modal Parameters")
         df_modes= pd.DataFrame([
             {
@@ -782,22 +761,21 @@ def main():
                 "Identified Frequency (Hz)": f"{m['identifiedFrequency']:.2f}",
                 "Error (%)": m["frequencyError"],
                 "MAC": m["mac"]
-            } for m in identified_modes
+            }
+            for m in identified_modes
         ])
         st.table(df_modes)
 
-        # Mode shape plotting
         st.markdown("#### Mode Shape Visualization")
         n_modes= len(identified_modes)
-        col_shapes= st.columns(n_modes)
-
+        col_vis= st.columns(n_modes)
         for i, mode_info in enumerate(identified_modes):
-            with col_shapes[i]:
+            with col_vis[i]:
                 st.markdown(f"**Mode {mode_info['modeNumber']}**")
                 df_mode= pd.DataFrame(mode_info["modeShapes"])
 
-                needed= {"position","trueShape","identifiedShape"}
-                if not needed.issubset(df_mode.columns) or df_mode.empty:
+                needed_cols= {"position","trueShape","identifiedShape"}
+                if not needed_cols.issubset(df_mode.columns) or df_mode.empty:
                     st.write("No shape data available for pinned-shape plot.")
                     continue
 
@@ -805,12 +783,12 @@ def main():
                 df_true_line= pd.concat([
                     pd.DataFrame({"position":[0],"trueShapeN":[0]}),
                     df_mode[["position","trueShape"]].rename(columns={"trueShape":"trueShapeN"}),
-                    pd.DataFrame({"position":[params["bridgeLength"]], "trueShapeN":[0]})
+                    pd.DataFrame({"position":[params['bridgeLength']],"trueShapeN":[0]})
                 ], ignore_index=True)
                 df_ident_line= pd.concat([
                     pd.DataFrame({"position":[0],"identifiedShapeN":[0]}),
                     df_mode[["position","identifiedShape"]].rename(columns={"identifiedShape":"identifiedShapeN"}),
-                    pd.DataFrame({"position":[params["bridgeLength"]], "identifiedShapeN":[0]})
+                    pd.DataFrame({"position":[params['bridgeLength']],"identifiedShapeN":[0]})
                 ], ignore_index=True)
 
                 line_true= alt.Chart(df_true_line).mark_line(strokeDash=[5,3], color="gray").encode(
@@ -837,46 +815,23 @@ def main():
                 )
 
     st.markdown("---")
-    st.subheader("References & Final Remarks")
-    st.markdown(r"""
-    **Real SSI**: 
-    This code is a Python translation of your MATLAB snippet:
-    \[
-    \text{function [Result]=SSID(output,fs,ncols,nrows,cut)} 
-    \]
-    which builds Hankel blocks (Yp, Yf), does a subspace SVD, extracts 
-    discrete-state matrices (A, C), then obtains eigenvalues to find 
-    frequencies, damping, and mode shapes.
+    st.subheader("References & Closing Remarks")
+    st.markdown("""
+    - **FDD** references:
+      1. Brincker, R., Zhang, L., & Andersen, P. (2000). *Modal Identification from Ambient Responses Using Frequency Domain Decomposition.* 
+         Proceedings of the 18th International Modal Analysis Conference (IMAC).
+    - **SSI** references:
+      2. Peeters, B., & De Roeck, G. (2001). *Stochastic System Identification for Operational Modal Analysis: A Review.* 
+         Journal of Dynamic Systems, Measurement, and Control, 123(4), 659–667.
+      3. Rainieri, C., & Fabbrocino, G. (2014). *Operational Modal Analysis of Civil Engineering Structures.* Springer.
+    - This code highlights how both FDD (spectral peaks + SVD) and SSI (Hankel matrix + subspace factorization) can reveal 
+      frequencies, damping, and mode shapes from output-only data.
 
-    **Educational Points**:
-    - Subspace methods (SSI) rely on time-domain block Hankel/projection 
-      operations to build a minimal realization from output data only. 
-    - The discrete eigenvalues \(\lambda\) convert to continuous s-plane 
-      poles by \(s = \ln(\lambda)\times f_s\). 
-    - Mode shapes are extracted from the first rows of the extended observability matrix (C) 
-      multiplied by the eigenvectors. 
-    - Additional indicators (EMAC, MPC, CMI) help interpret mode quality.
-
-    **References**:
-    1. Brincker, R., & Ventura, C. (2015). *Introduction to Operational Modal Analysis*. Wiley.
-    2. Peeters, B., & De Roeck, G. (2001). *Stochastic System Identification for Operational Modal Analysis: A Review*.
-       Journal of Dynamic Systems, Measurement, and Control, 123(4), 659-667.
-    3. Rainieri, C., & Fabbrocino, G. (2014). *Operational Modal Analysis of Civil Engineering Structures*. Springer.
-    4. Au, S. K. (2017). *Operational Modal Analysis: Modeling, Bayesian Inference, Uncertainty Laws*. Springer.
-    5. Brincker, R., Zhang, L., & Andersen, P. (2000). *Modal identification from ambient responses using frequency domain decomposition*.
-       In Proceedings of the 18th International Modal Analysis Conference (IMAC), San Antonio, Texas.
-    6. Adapted SSI code from your snippet with license disclaimers in mind.
-
-    ---
-    **How to proceed**:
-    1. Adjust parameter sliders & generate data. 
-    2. Choose FDD or SSI. 
-    3. Compare identified frequencies, damping, and mode shapes. 
-    4. Use indicators (EMAC, MPC, CMI, partfac) from the `Result` dictionary for deeper analysis if needed.
+    Thank you for using this OMA educational tool!
     """)
 
 ################################################################################
-# 5) If invoked directly, run main()
+# 7) If invoked directly, run main()
 ################################################################################
 if __name__=="__main__":
     main()
